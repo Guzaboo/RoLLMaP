@@ -34,7 +34,7 @@ matches = []
 for i in range(1, 39):
     f = open(f"..\\rocket-league-scribe\\recordings\\{i}.json", "r")
     doc = json.load(f)
-    winner = torch.FloatTensor(doc['winner'])
+    winner = torch.IntTensor([doc['winner']])
     snapshots = doc['snapshots']
     times = []
     balls = []
@@ -79,7 +79,7 @@ class TeamRNN(nn.Module):
     def __init__(self, player_size, player_hidden_size):
         super(TeamRNN, self).__init__()
         self.playerNet = PlayerRNN(player_size, player_hidden_size)
-        self.conv = nn.Conv1d(player_size, player_size, 3, padding = 0)
+        self.conv = nn.Conv1d(player_hidden_size, player_hidden_size, 3, padding = 0)
 
     def forward(self, players, hiddens):
         playerEmbeds, hiddensNext = self.playerNet(players, hiddens) # uses batch dimension of 3 (# of players on a team)
@@ -93,9 +93,9 @@ class GameNet(nn.Module):
         super(GameNet, self).__init__()
         self.teamNet = TeamRNN(player_size, player_hidden_size)
         # self.playerNet = PlayerRNN(player_size, player_hidden_size)
-        self.conv = nn.Conv1d(player_size + 1, player_size + 1, 2, padding = 0) # add one for the score number
-        self.linear = nn.Linear(player_size + 1 + 4 + 2, 2) # 1 for score, 4 for ball, 2 for times
-        self.softmax = nn.Softmax()
+        self.conv = nn.Conv1d(player_hidden_size + 1, player_hidden_size + 1, 2, padding = 0) # add one for the score number
+        self.linear = nn.Linear(player_hidden_size + 1 + 4 + 2, 2) # 1 for score, 4 for ball, 2 for times
+        self.softmax = nn.Softmax(dim=0)
 
     def forward(self, team1, team2, hiddens1, hiddens2, scores, ball, times):
         teamEmbed1, hiddens1Next = self.teamNet(team1, hiddens1)
@@ -112,18 +112,53 @@ class GameNet(nn.Module):
     def init_hidden(self):
         return self.teamNet.init_hidden()
 
+class WinnerLoss(nn.Module):
+    def __init__(self):
+        super(WinnerLoss, self).__init__()
+        self.lossModule = nn.CrossEntropyLoss()
+        self.results = torch.FloatTensor([[1,0],[0,1]])
+
+    def forward(self, prediction, winner):
+        return self.lossModule(prediction, self.results[winner].view(-1))
+    
+class UncertaintyLoss(nn.Module):
+    def __init__(self):
+        super(UncertaintyLoss, self).__init__()
+        self.lossModule = nn.CrossEntropyLoss()
+        self.expected = torch.FloatTensor([0.5,0.5])
+
+    def forward(self, prediction):
+        return self.lossModule(prediction, self.expected)
+
 """ hyperparameters """
-player_hidden_size = 16
+player_hidden_size = 200
 
 network = GameNet(matches[0].history.team1[0].shape[1], player_hidden_size)
+
+num_params = sum([np.prod(p.size()) for p in network.parameters()])
+print(f"# Parameters: {num_params}")
 
 testMatch = matches[0]
 prediction, hiddens1, hiddens2 = network(testMatch.history.team1[0], testMatch.history.team2[0], network.init_hidden(), network.init_hidden(), testMatch.history.scores[0], testMatch.history.ball[0], testMatch.history.times[0])
 print(prediction)
 
-num_params = sum([np.prod(p.size()) for p in network.parameters()])
-print(f"# Parameters: {num_params}")
+optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
+winnerLoss = WinnerLoss()
+uncertaintyLoss = UncertaintyLoss()
+i = 0
+while True:
+    loss = uncertaintyLoss(prediction) + winnerLoss(prediction, testMatch.winner)
+    print(loss)
+    if(loss < 0.1):
+        break
+    loss.backward()
+    optimizer.step()
 
+    optimizer.zero_grad()
+    i = (i + 1) % len(matches)
+    testMatch = matches[i]
+    prediction, hiddens1, hiddens2 = network(testMatch.history.team1[150], testMatch.history.team2[150], network.init_hidden(), network.init_hidden(), testMatch.history.scores[150], testMatch.history.ball[150], testMatch.history.times[150])
+    print(prediction)
 # class RoLLMaPDataset(Dataset):
 #     def __init__(self, data):
 #         super().__init__()
