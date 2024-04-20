@@ -112,10 +112,11 @@ for i in range(1, 39):
     matches.append(match)
 
 class PlayerRNN(nn.Module):
-    def __init__(self, player_size, player_hidden_size):
+    def __init__(self, player_size, player_hidden_size, batch_size):
         super(PlayerRNN, self).__init__()
         self.player_hidden_size = player_hidden_size
         self.num_layers = 1
+        self.batch_size = batch_size
 
         self.linear = nn.Linear(player_size, player_size)
         self.relu = nn.ReLU()
@@ -126,41 +127,68 @@ class PlayerRNN(nn.Module):
         return self.gru(linear, hidden)
 
     def init_hidden(self):
-        return torch.zeros(self.num_layers, 3, self.player_hidden_size)
+        return torch.zeros(self.num_layers, self.batch_size, self.player_hidden_size)
 
-class TeamRNN(nn.Module):
-    def __init__(self, player_size, player_hidden_size):
-        super(TeamRNN, self).__init__()
-        self.playerNet = PlayerRNN(player_size, player_hidden_size)
-        self.conv = nn.Conv1d(player_hidden_size, player_hidden_size, 3, padding = 0)
+class TeamNet(nn.Module):
+    def __init__(self, player_size, player_hidden_size, batch_size):
+        super(TeamNet, self).__init__()
+        self.playerNet = PlayerRNN(player_size, player_hidden_size, batch_size)
+        # self.conv = nn.Conv1d(player_hidden_size, player_hidden_size, 3, padding = 0)
+        self.linear = nn.Linear(player_hidden_size * 3, player_hidden_size)
+        self.relu = nn.ReLU()
 
     def forward(self, players, hiddens):
-        playerEmbeds, hiddensNext = self.playerNet(players, hiddens) # uses batch dimension of 3 (# of players on a team)
-        return self.conv(playerEmbeds.permute(0, 2, 1)).view(-1), hiddensNext # Now we treat the player_size dimension as the layers dimension (no batches)
+        # playerEmbeds, hiddensNext = self.playerNet(players, hiddens) # uses batch dimension of 3 (# of players on a team)
+        # return self.conv(playerEmbeds.permute(0, 2, 1)).view(-1), hiddensNext # Now we treat the player_size dimension as the layers dimension (no batches)
+        playerEmbeds = []
+        nextHiddens = []
+        for player, hidden in zip(players.permute(1, 0, 2), hiddens.permute(2, 0, 1, 3)):
+            playerEmbed, nextHidden = self.playerNet(player, hidden)
+            playerEmbeds.append(playerEmbed.squeeze(0))
+            nextHiddens.append(nextHidden)
+
+        allPlayers = []
+        allPlayers.append(torch.cat((playerEmbeds[0], playerEmbeds[1], playerEmbeds[2]), 1))
+        allPlayers.append(torch.cat((playerEmbeds[0], playerEmbeds[2], playerEmbeds[1]), 1))
+        allPlayers.append(torch.cat((playerEmbeds[1], playerEmbeds[0], playerEmbeds[2]), 1))
+        allPlayers.append(torch.cat((playerEmbeds[1], playerEmbeds[2], playerEmbeds[0]), 1))
+        allPlayers.append(torch.cat((playerEmbeds[2], playerEmbeds[0], playerEmbeds[1]), 1))
+        allPlayers.append(torch.cat((playerEmbeds[2], playerEmbeds[1], playerEmbeds[0]), 1))
+
+        teamEmbed = self.relu(torch.mean(torch.stack([self.linear(concatenated) for concatenated in allPlayers]), 0))
+
+        return teamEmbed, torch.stack(nextHiddens).permute(1, 2, 0, 3)
 
     def init_hidden(self):
-        return self.playerNet.init_hidden()
+        return torch.stack([self.playerNet.init_hidden() for _ in range(3)]).permute(1, 2, 0, 3)
 
 class GameNet(nn.Module):
-    def __init__(self, player_size, player_hidden_size):
+    def __init__(self, player_size, player_hidden_size, batch_size):
         super(GameNet, self).__init__()
-        self.teamNet = TeamRNN(player_size, player_hidden_size)
-        # self.playerNet = PlayerRNN(player_size, player_hidden_size)
-        self.conv = nn.Conv1d(player_hidden_size + 1, player_hidden_size + 1, 2, padding = 0) # add one for the score number
-        self.linear = nn.Linear(player_hidden_size + 1 + 4 + 2, 2) # 1 for score, 4 for ball, 2 for times
-        self.softmax = nn.Softmax(dim=0)
+        team_embed_size = player_hidden_size
+        self.teamNet = TeamNet(player_size, team_embed_size, batch_size)
+        # self.conv = nn.Conv1d(player_hidden_size + 1, player_hidden_size + 1, 2, padding = 0) # add one for the score number
+        self.linear = nn.Linear(2*(team_embed_size + 1) + 4 + 2, 2) # 1 for score, 4 for ball, 2 for times
+        self.softmax = nn.Softmax(dim=1)
 
     def forward(self, team1, team2, hiddens1, hiddens2, scores, ball, times):
         teamEmbed1, hiddens1Next = self.teamNet(team1, hiddens1)
-        team1WithScores = torch.cat((teamEmbed1, scores[0].unsqueeze(0)))
-        team1WithScores.unsqueeze_(0)
+        team1WithScores = torch.cat((teamEmbed1, scores[:,0].unsqueeze(1)), 1)
+        # team1WithScores.unsqueeze_(0)
         teamEmbed2, hiddens2Next = self.teamNet(team2, hiddens2)
-        team2WithScores = torch.cat((teamEmbed2, scores[1].unsqueeze(0)))
-        team2WithScores.unsqueeze_(0)
-        combined = torch.cat((team1WithScores, team2WithScores))
-        bothTeams = self.conv(combined.permute(1, 0)).view(-1)
-        game = torch.cat((bothTeams, ball, times)) # cat with ball and times
-        return self.softmax(self.linear(game)), hiddens1Next, hiddens2Next # Convolve the team embeds over the team dimension with player_size channels (no batches)
+        team2WithScores = torch.cat((teamEmbed2, scores[:,1].unsqueeze(1)), 1)
+        # team2WithScores.unsqueeze_(0)
+        combined1 = torch.cat((team1WithScores, team2WithScores), 1)
+        combined2 = torch.cat((team2WithScores, team1WithScores), 1)
+        # bothTeams = self.conv(combined.permute(1, 0)).view(-1)
+        rotatedBall = torch.clone(ball) # TODO - rotate ball
+        rotatedBall[:, [1, 2]] *= -1
+        games = []
+        games.append(torch.cat((combined1, ball, times), 1)) # cat with ball and times
+        games.append(torch.cat((combined2, rotatedBall, times), 1))
+        processedGames = torch.stack([self.linear(game) for game in games])
+        processedGames[1,:,[0,1]] = processedGames[1,:,[1,0]]
+        return self.softmax(torch.mean(processedGames, 0)), hiddens1Next, hiddens2Next # Convolve the team embeds over the team dimension with player_size channels (no batches)
 
     def init_hidden(self):
         return self.teamNet.init_hidden()
@@ -172,7 +200,7 @@ class WinnerLoss(nn.Module):
         self.results = torch.FloatTensor([[1,0],[0,1]])
 
     def forward(self, prediction, winner):
-        return self.lossModule(prediction, self.results[winner].view(-1))
+        return self.lossModule(prediction, self.results[winner])
     
 class UncertaintyLoss(nn.Module):
     def __init__(self):
@@ -194,17 +222,19 @@ class RoLLMaPDataset(Dataset):
         return self.matches[index % len(self.matches)].permute(index // len(self.matches))
 
     def __len__(self):
-        return len(self.matches) * 72 # 6 ways you can order team 1 players * 6 ways you can order team 2 players * 2 ways you can order the teams
+        # return len(self.matches) * 72 # 6 ways you can order team 1 players * 6 ways you can order team 2 players * 2 ways you can order the teams
+        return len(self.matches)
     
 
 
 """ hyperparameters """
 player_hidden_size = 200
-learning_rate = 1e-5
+learning_rate = 1e-4
 symmetry_step_every_n_steps = 10
 symmetry_train_steps = 10
+batch_size = 7
 
-network = GameNet(matches[0].history.team1[0].shape[1], player_hidden_size)
+network = GameNet(matches[0].history.team1[0].shape[1], player_hidden_size, batch_size)
 optimizer = torch.optim.Adam(network.parameters(), lr=learning_rate)
 dataset = RoLLMaPDataset(matches)
 winnerLoss = WinnerLoss()
@@ -216,39 +246,76 @@ print(f"# Parameters: {num_params}")
 
 print(f"# of items in dataset: {len(dataset)}")
 
-def learn_symmetry(network, lossFn, optimizer):
-    # lossFn.zero_grad()
-    index = random.randint(0, len(dataset) // 72 - 1)
-    match = dataset[index]
-    permuteNum = random.randint(1, 71)
-    flipPrediction = permuteNum // 36 == 1
-    permutation = match.permute(permuteNum)
-    hiddens1, hiddens2, hiddens3, hiddens4 = network.init_hidden(), network.init_hidden(), network.init_hidden(), network.init_hidden()
-    timeSteps = len(match.history.times)
-    # totalLoss = torch.tensor(0)
-    for i in range(timeSteps):
-        lossFn.zero_grad()
-        prediction1, hiddens1, hiddens2 = network(match.history.team1[i], match.history.team2[i], hiddens1, hiddens2, match.history.scores[i], match.history.ball[i], match.history.times[i])
-        prediction2, hiddens3, hiddens4 = network(permutation.history.team1[i], permutation.history.team2[i], hiddens3, hiddens4, permutation.history.scores[i], permutation.history.ball[i], permutation.history.times[i])
-        if flipPrediction:
-            prediction2 = prediction2[[1, 0]]
-        # totalLoss += lossFn(prediction1, prediction2)
-        loss = lossFn(prediction1, prediction2)
-        if (i + 1) % symmetry_step_every_n_steps == 0 or i == timeSteps - 1:
+def train_model(network, lossFn, optimizer):
+    matches = [dataset[random.randint(0, len(dataset) - 1)] for _ in range(batch_size)]
+    num_forced_winner1 = batch_size // 3
+    num_forced_winner2 = batch_size // 3
+    for i in range(num_forced_winner1):
+        if matches[i].winner != 0:
+            matches[i] = matches[i].permute(36)
+    for i in range(num_forced_winner1, num_forced_winner1 + num_forced_winner2):
+        if matches[i].winner != 1:
+            matches[i] = matches[i].permute(36)
+
+    winners = torch.stack([match.winner for match in matches]).squeeze(1)
+    hiddens1 = network.init_hidden()
+    hiddens2 = network.init_hidden()
+    maxTimesteps = max([len(match.history.times) for match in matches])
+    for i in range(maxTimesteps):
+        team1s = torch.stack([match.history.team1[i if i < len(match.history.times) else -1] for match in matches], dim=0)
+        team2s = torch.stack([match.history.team2[i if i < len(match.history.times) else -1] for match in matches], dim=0)
+        scores = torch.stack([match.history.scores[i if i < len(match.history.times) else -1] for match in matches], dim=0)
+        balls = torch.stack([match.history.ball[i if i < len(match.history.times) else -1] for match in matches], dim=0)
+        times = torch.stack([match.history.times[i if i < len(match.history.times) else -1] for match in matches], dim=0)
+        predictions, hiddens1, hiddens2 = network(team1s, team2s, hiddens1, hiddens2, scores, balls, times)
+        if i % 10 == 9 or i == maxTimesteps - 1:
+            loss = lossFn(predictions, winners)
             loss.backward()
-            hiddens1.detach_()
-            hiddens2.detach_()
-            hiddens3.detach_()
-            hiddens4.detach_()
+            hiddens1 = hiddens1.detach()
+            hiddens2 = hiddens2.detach()
             optimizer.step()
-    # totalLoss.backward()
-    # optimizer.step()
+
 
 while True:
-    for _ in range(symmetry_train_steps):
-        learn_symmetry(network, crossEntropyLoss, optimizer)
+    # for _ in range(symmetry_train_steps):
+    #     learn_symmetry(network, crossEntropyLoss, optimizer)
     # do normal training here
-    print("normal train")
+    # print("normal train")
+    train_model(network, winnerLoss, optimizer)
+
+# def learn_symmetry(network, lossFn, optimizer):
+#     # lossFn.zero_grad()
+#     index = random.randint(0, len(dataset) // 72 - 1)
+#     match = dataset[index]
+#     permuteNum = random.randint(1, 71)
+#     flipPrediction = permuteNum // 36 == 1
+#     permutation = match.permute(permuteNum)
+#     hiddens1, hiddens2, hiddens3, hiddens4 = network.init_hidden(), network.init_hidden(), network.init_hidden(), network.init_hidden()
+#     timeSteps = len(match.history.times)
+#     # totalLoss = torch.tensor(0)
+#     for i in range(timeSteps):
+#         lossFn.zero_grad()
+#         prediction1, hiddens1, hiddens2 = network(match.history.team1[i], match.history.team2[i], hiddens1, hiddens2, match.history.scores[i], match.history.ball[i], match.history.times[i])
+#         prediction2, hiddens3, hiddens4 = network(permutation.history.team1[i], permutation.history.team2[i], hiddens3, hiddens4, permutation.history.scores[i], permutation.history.ball[i], permutation.history.times[i])
+#         if flipPrediction:
+#             prediction2 = prediction2[[1, 0]]
+#         # totalLoss += lossFn(prediction1, prediction2)
+#         loss = lossFn(prediction1, prediction2)
+#         if (i + 1) % symmetry_step_every_n_steps == 0 or i == timeSteps - 1:
+#             loss.backward()
+#             hiddens1.detach_()
+#             hiddens2.detach_()
+#             hiddens3.detach_()
+#             hiddens4.detach_()
+#             optimizer.step()
+#     # totalLoss.backward()
+#     # optimizer.step()
+
+# while True:
+#     for _ in range(symmetry_train_steps):
+#         learn_symmetry(network, crossEntropyLoss, optimizer)
+#     # do normal training here
+#     print("normal train")
 
 # testMatch = matches[0]
 # prediction, hiddens1, hiddens2 = network(testMatch.history.team1[0], testMatch.history.team2[0], network.init_hidden(), network.init_hidden(), testMatch.history.scores[0], testMatch.history.ball[0], testMatch.history.times[0])
