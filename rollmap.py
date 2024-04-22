@@ -2,8 +2,7 @@ import json
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import numpy as np
 import random
 import matplotlib.pyplot as plt
@@ -144,13 +143,10 @@ class TeamNet(nn.Module):
     def __init__(self, player_size, player_hidden_size):
         super(TeamNet, self).__init__()
         self.playerNet = PlayerRNN(player_size, player_hidden_size)
-        # self.conv = nn.Conv1d(player_hidden_size, player_hidden_size, 3, padding = 0)
         self.linear = nn.Linear(player_hidden_size * 3, player_hidden_size, device=device)
         self.relu = nn.ReLU()
 
     def forward(self, players, hiddens):
-        # playerEmbeds, hiddensNext = self.playerNet(players, hiddens) # uses batch dimension of 3 (# of players on a team)
-        # return self.conv(playerEmbeds.permute(0, 2, 1)).view(-1), hiddensNext # Now we treat the player_size dimension as the layers dimension (no batches)
         playerEmbeds = []
         nextHiddens = []
         for player, hidden in zip(players.permute(1, 0, 2), hiddens.permute(2, 0, 1, 3)):
@@ -178,20 +174,16 @@ class GameNet(nn.Module):
         super(GameNet, self).__init__()
         team_embed_size = player_hidden_size
         self.teamNet = TeamNet(player_size, team_embed_size)
-        # self.conv = nn.Conv1d(player_hidden_size + 1, player_hidden_size + 1, 2, padding = 0) # add one for the score number
         self.linear = nn.Linear(2*(team_embed_size + 1) + 4 + 2, 2, device=device) # 1 for score, 4 for ball, 2 for times
         self.softmax = nn.Softmax(dim=1)
 
     def forward(self, team1, team2, hiddens1, hiddens2, scores, ball, times):
         teamEmbed1, hiddens1Next = self.teamNet(team1, hiddens1)
         team1WithScores = torch.cat((teamEmbed1, scores[:,0].unsqueeze(1)), 1)
-        # team1WithScores.unsqueeze_(0)
         teamEmbed2, hiddens2Next = self.teamNet(team2, hiddens2)
         team2WithScores = torch.cat((teamEmbed2, scores[:,1].unsqueeze(1)), 1)
-        # team2WithScores.unsqueeze_(0)
         combined1 = torch.cat((team1WithScores, team2WithScores), 1)
         combined2 = torch.cat((team2WithScores, team1WithScores), 1)
-        # bothTeams = self.conv(combined.permute(1, 0)).view(-1)
         rotatedBall = torch.clone(ball) # TODO - rotate ball
         rotatedBall[:, [1, 2]] *= -1
         games = []
@@ -212,15 +204,7 @@ class WinnerLoss(nn.Module):
 
     def forward(self, prediction, winner):
         return self.lossModule(prediction, self.results[winner])
-    
-class UncertaintyLoss(nn.Module):
-    def __init__(self):
-        super(UncertaintyLoss, self).__init__()
-        self.lossModule = nn.CrossEntropyLoss()
-        self.expected = torch.tensor([0.5,0.5], dtype=torch.float32, device=device)
-
-    def forward(self, prediction):
-        return self.lossModule(prediction, self.expected)
+        # return torch.mean(self.results[(winner + 1) % 2] * prediction)
 
 class RoLLMaPDataset(Dataset):
     def __init__(self, matches):
@@ -233,25 +217,22 @@ class RoLLMaPDataset(Dataset):
         return self.matches[index % len(self.matches)].permute(index // len(self.matches))
 
     def __len__(self):
-        # return len(self.matches) * 72 # 6 ways you can order team 1 players * 6 ways you can order team 2 players * 2 ways you can order the teams
         return len(self.matches)
     
 
 
 """ hyperparameters """
-player_hidden_size = 20
+player_hidden_size = 200
 learning_rate = 1e-4
-symmetry_step_every_n_steps = 10
-symmetry_train_steps = 10
 batch_size = 7
 test_batch_size = 3
 percent_training_data = .90
+num_batches = 50
 
 network = GameNet(matches[0].history.team1[0].shape[1], player_hidden_size)
 optimizer = torch.optim.Adam(network.parameters(), lr=learning_rate)
 dataset = RoLLMaPDataset(matches)
 winnerLoss = WinnerLoss()
-uncertaintyLoss = UncertaintyLoss()
 
 num_params = sum([np.prod(p.size()) for p in network.parameters()])
 print(f"# Parameters: {num_params}")
@@ -260,7 +241,6 @@ print(f"# of items in dataset: {len(dataset)}")
 
 def train_model(network, lossFn, optimizer):
     matches = [dataset[i] for i in random.sample(range(0, math.floor(len(dataset) * percent_training_data)), batch_size)]
-    # matches = [dataset[random.randint(0, math.floor(len(dataset) * percent_training_data) - 1)] for _ in range(batch_size)]
     num_forced_winner1 = batch_size // 3
     num_forced_winner2 = batch_size // 3
     for i in range(num_forced_winner1):
@@ -274,6 +254,8 @@ def train_model(network, lossFn, optimizer):
     hiddens1 = network.init_hidden(batch_size)
     hiddens2 = network.init_hidden(batch_size)
     maxTimesteps = max([len(match.history.times) for match in matches])
+    totalLoss = torch.tensor(0, dtype=torch.float32, device=device)
+    numLossCalculations = 0
     for i in range(maxTimesteps):
         team1s = torch.stack([match.history.team1[i if i < len(match.history.times) else -1] for match in matches], dim=0)
         team2s = torch.stack([match.history.team2[i if i < len(match.history.times) else -1] for match in matches], dim=0)
@@ -283,16 +265,18 @@ def train_model(network, lossFn, optimizer):
         predictions, hiddens1, hiddens2 = network(team1s, team2s, hiddens1, hiddens2, scores, balls, times)
         if i % 10 == 9 or i == maxTimesteps - 1:
             loss = lossFn(predictions, winners)
+            totalLoss += loss
+            numLossCalculations += 1
             loss.backward()
             hiddens1 = hiddens1.detach()
             hiddens2 = hiddens2.detach()
             optimizer.step()
+    return totalLoss.item() / numLossCalculations
 
 def test_model(network, lossFn, drawGraph):
     with torch.no_grad():
         indices = random.sample(range(math.floor(len(dataset) * percent_training_data), len(dataset)), test_batch_size)
         matches = [dataset[i] for i in indices]
-        # matches = [dataset[random.randint(math.floor(len(dataset) * percent_training_data), len(dataset) - 1)] for _ in range(test_batch_size)]
 
         winners = torch.stack([match.winner for match in matches]).squeeze(1)
         hiddens1 = network.init_hidden(test_batch_size)
@@ -337,8 +321,22 @@ def test_model(network, lossFn, drawGraph):
                 plt.show()
         return totalLoss.item() / maxTimesteps
 
+train_losses = []
+test_losses = []
+
 batches_trained = 0
-while True:
-    train_model(network, winnerLoss, optimizer)
+while batches_trained < num_batches:
+    train_losses.append(train_model(network, winnerLoss, optimizer))
     batches_trained += 1
-    print(test_model(network, winnerLoss, batches_trained % 10 == 0))
+    print(f"Trained on {batches_trained} batches")
+    test_losses.append(test_model(network, winnerLoss, batches_trained % 10 == 0))
+
+fig = plt.figure()
+ax = fig.add_subplot(111)
+ax.plot(range(num_batches), train_losses, label='Training Loss')
+ax.plot(range(num_batches), test_losses, label='Testing Loss')
+plt.title(f'Loss')
+plt.xlabel('# batches used for training')
+plt.ylabel('Average loss')
+plt.legend()
+plt.show()
