@@ -222,7 +222,7 @@ class RoLLMaPDataset(Dataset):
 
 
 """ hyperparameters """
-player_hidden_size = 200
+player_hidden_size = 20
 learning_rate = 1e-4
 batch_size = 7
 test_batch_size = 3
